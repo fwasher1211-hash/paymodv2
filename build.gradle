@@ -1,35 +1,121 @@
-plugins {
-    id 'fabric-loom' version '1.7-SNAPSHOT'
-    id 'java'
-}
+package com.you.donutpay;
 
-base { archivesName = project.archives_base_name }
-version = project.mod_version
-group = project.maven_group
+import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
+import net.minecraft.text.ClickEvent;
+import net.minecraft.text.HoverEvent;
+import net.minecraft.text.Style;
+import net.minecraft.text.Text;
+import net.minecraft.util.Formatting;
 
-repositories {
-    mavenCentral()
-}
+import java.util.Locale;
+import java.util.UUID;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
-dependencies {
-    minecraft "com.mojang:minecraft:${project.minecraft_version}"
-    mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
-    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
-    modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
-}
+/**
+ * Detects "X paid you $10K" in chat and appends a clickable [2x $20K]
+ * that runs /pay X 20000.
+ */
+public class ChatListener {
 
-processResources {
-    inputs.property "version", project.version
-    filesMatching("fabric.mod.json") {
-        expand "version": project.version
+    private record Parsed(String name, double amount) {}
+
+    // "ProllyInPoland paid you $ 10K"  (no start anchor, tolerates "$ " and rank icons)
+    private static final Pattern PAID_YOU = Pattern.compile(
+            "([A-Za-z0-9_.]+)\\s+(?:paid|tipped|gave)\\s+you\\s+\\D*?([\\d,]*\\.?\\d+)\\s*([kmbt])?(?![A-Za-z])",
+            Pattern.CASE_INSENSITIVE
+    );
+
+    private static final Pattern RECEIVED_FROM = Pattern.compile(
+            "(?:received|got)\\s+\\D*?([\\d,]*\\.?\\d+)\\s*([kmbt])?(?![A-Za-z])\\s+from\\s+([A-Za-z0-9_.]+)",
+            Pattern.CASE_INSENSITIVE
+    );
+
+    private static String lastKey = "";
+    private static long lastTime = 0;
+
+    public static void register() {
+        ClientReceiveMessageEvents.MODIFY_GAME.register((message, overlay) -> {
+            Parsed p = parse(message.getString());
+            if (p == null) return message;
+
+            record(p);                      // shows up in the H menu too
+            if (overlay) return message;    // action bar can't be clicked
+
+            return message.copy().append(button(p));
+        });
     }
-}
 
-java {
-    toolchain { languageVersion = JavaLanguageVersion.of(21) }
-    withSourcesJar()
-}
+    private static Parsed parse(String text) {
+        if (text == null || text.isEmpty()) return null;
 
-tasks.withType(JavaCompile).configureEach {
-    options.release = 21
+        Matcher m = PAID_YOU.matcher(text);
+        if (m.find()) {
+            double a = parseAmount(m.group(2), m.group(3));
+            if (a > 0) return new Parsed(m.group(1), a);
+        }
+
+        m = RECEIVED_FROM.matcher(text);
+        if (m.find()) {
+            double a = parseAmount(m.group(1), m.group(2));
+            if (a > 0) return new Parsed(m.group(3), a);
+        }
+        return null;
+    }
+
+    private static Text button(Parsed p) {
+        long pay = Math.round(p.amount() * 2);
+        String cmd = "/pay " + p.name() + " " + pay;
+        return Text.literal(" [2x $" + fmt(pay) + "]").setStyle(Style.EMPTY
+                .withColor(Formatting.GOLD)
+                .withBold(true)
+                .withClickEvent(new ClickEvent(ClickEvent.Action.RUN_COMMAND, cmd))
+                .withHoverEvent(new HoverEvent(HoverEvent.Action.SHOW_TEXT,
+                        Text.literal("Click to run " + cmd))));
+    }
+
+    private static void record(Parsed p) {
+        // DonutSMP can show the same payment in chat and the action bar - store it once
+        String key = p.name() + ":" + p.amount();
+        long now = System.currentTimeMillis();
+        if (key.equals(lastKey) && now - lastTime < 3000) return;
+        lastKey = key;
+        lastTime = now;
+
+        DonutPayClient.STORE.addPayment(new PaymentStore.Payment(
+                UUID.randomUUID(), p.name(), "tip", now, p.amount()
+        ));
+    }
+
+    private static double parseAmount(String num, String suffix) {
+        double v;
+        try {
+            v = Double.parseDouble(num.replace(",", ""));
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+        if (suffix != null) {
+            switch (Character.toLowerCase(suffix.charAt(0))) {
+                case 'k' -> v *= 1_000d;
+                case 'm' -> v *= 1_000_000d;
+                case 'b' -> v *= 1_000_000_000d;
+                case 't' -> v *= 1_000_000_000_000d;
+                default -> { }
+            }
+        }
+        return v;
+    }
+
+    private static String fmt(double v) {
+        if (v >= 1e12) return trim(v / 1e12) + "T";
+        if (v >= 1e9) return trim(v / 1e9) + "B";
+        if (v >= 1e6) return trim(v / 1e6) + "M";
+        if (v >= 1e3) return trim(v / 1e3) + "K";
+        return trim(v);
+    }
+
+    private static String trim(double d) {
+        String s = String.format(Locale.ROOT, "%.2f", d);
+        return s.replaceAll("\\.?0+$", "");
+    }
 }
